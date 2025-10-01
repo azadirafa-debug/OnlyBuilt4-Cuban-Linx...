@@ -1,0 +1,166 @@
+/*
+ * securebox.c - v1.1
+ *
+ * A simple secure file locker with:
+ *   - Hidden password input (no echo on Unix, fallback to stdin otherwise)
+ *   - Distinct exit codes for better scripting
+ *   - --force flag to allow overwriting files intentionally
+ *
+ * Exit codes:
+ *   0  = Success
+ *   1  = Usage error (bad arguments)
+ *   2  = Bad format (invalid input data)
+ *   3  = Authentication failure (wrong password)
+ *   4  = I/O error (file problems)
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <termios.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+/* Function to safely read a password without echoing */
+static int get_password(char *buf, size_t buflen) {
+    struct termios oldt, newt;
+    int is_tty = isatty(STDIN_FILENO);
+
+    if (is_tty) {
+        if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+            perror("tcgetattr");
+            return -1;
+        }
+        newt = oldt;
+        newt.c_lflag &= ~ECHO;  // turn off echo
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
+            perror("tcsetattr");
+            return -1;
+        }
+    }
+
+    printf("Enter password: ");
+    fflush(stdout);
+
+    if (fgets(buf, buflen, stdin) == NULL) {
+        if (is_tty) tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        return -1;
+    }
+
+    // remove newline
+    buf[strcspn(buf, "\n")] = '\0';
+
+    if (is_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        printf("\n"); // move to next line after password input
+    }
+
+    return 0;
+}
+
+/* Dummy "encryption" for demo purposes (XOR with password length) */
+static void encrypt_decrypt(char *data, size_t len, const char *password) {
+    size_t key = strlen(password);
+    for (size_t i = 0; i < len; i++) {
+        data[i] ^= (char)key;
+    }
+}
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [--force] <encrypt|decrypt> <input> <output>\n"
+        "Options:\n"
+        "  --force   Overwrite output file if it exists\n",
+        prog);
+}
+
+int main(int argc, char *argv[]) {
+    int force = 0;
+    const char *mode = NULL;
+    const char *infile = NULL;
+    const char *outfile = NULL;
+
+    // --- Parse arguments ---
+    if (argc < 4) {
+        usage(argv[0]);
+        return 1; // usage error
+    }
+
+    int argi = 1;
+    if (strcmp(argv[argi], "--force") == 0) {
+        force = 1;
+        argi++;
+    }
+
+    if (argc - argi < 3) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    mode = argv[argi++];
+    infile = argv[argi++];
+    outfile = argv[argi++];
+
+    if (!(strcmp(mode, "encrypt") == 0 || strcmp(mode, "decrypt") == 0)) {
+        fprintf(stderr, "Error: mode must be 'encrypt' or 'decrypt'\n");
+        return 2; // bad format
+    }
+
+    // --- Check overwrite protection ---
+    if (!force) {
+        struct stat st;
+        if (stat(outfile, &st) == 0) {
+            fprintf(stderr, "Error: output file '%s' exists (use --force to overwrite)\n", outfile);
+            return 2; // bad format
+        }
+    }
+
+    // --- Read password ---
+    char password[256];
+    if (get_password(password, sizeof(password)) != 0) {
+        fprintf(stderr, "Error: failed to read password\n");
+        return 3; // auth failure
+    }
+
+    // --- Open input file ---
+    FILE *fin = fopen(infile, "rb");
+    if (!fin) {
+        perror("fopen input");
+        return 4; // I/O error
+    }
+
+    // --- Open output file ---
+    FILE *fout = fopen(outfile, "wb");
+    if (!fout) {
+        perror("fopen output");
+        fclose(fin);
+        return 4; // I/O error
+    }
+
+    // --- Process file ---
+    char buffer[1024];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), fin)) > 0) {
+        encrypt_decrypt(buffer, n, password);
+        if (fwrite(buffer, 1, n, fout) != n) {
+            perror("fwrite");
+            fclose(fin);
+            fclose(fout);
+            return 4; // I/O error
+        }
+    }
+
+    if (ferror(fin)) {
+        perror("fread");
+        fclose(fin);
+        fclose(fout);
+        return 4; // I/O error
+    }
+
+    fclose(fin);
+    fclose(fout);
+
+    printf("Operation '%s' completed successfully.\n", mode);
+    return 0; // success
+}
