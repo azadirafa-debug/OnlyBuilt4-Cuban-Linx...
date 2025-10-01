@@ -1,0 +1,60 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#define QUOTES 100
+
+// --- Sarcastic quotes array ---
+const char *quotes[QUOTES] = {
+    "Bravo, genius… forgot your password again? Muito inteligente.",
+    "Ay naku, ang talino mo talaga. (Not.)",
+    "Mnogo umen si… said no one ever.",
+    "Password ready. Try not to lose it in 5 seconds, amigo.",
+    "Wow, ikaw na! Nobel Prize for typing numbers wrong.",
+    "Glorious brain malfunction detected. Restart needed.",
+    "Parabéns, você conseguiu… to waste my time.",
+    "Seryoso? That’s your idea of smart?",
+    "Mnogo dobre… if we lived in opposite land.",
+    "Here’s your password. Don’t cry when you forget it.",
+    // … add up to 100 variations mixing PT, TL, BG, broken EN
+};
+
+// --- Password generator ---
+int main(void) {
+    const char charset[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789"
+        "!@#$%^&*?";
+    int charsetSize = sizeof(charset) - 1;
+
+    int length;
+    printf("Enter password length (positive number, genius): ");
+    if (scanf("%d", &length) != 1 || length <= 0) {
+        printf("Error: even this was too hard? Try again.\n");
+        return 1;
+    }
+
+    char *password = malloc(length + 1);
+    if (!password) {
+        printf("Memory fail. Bravo, you broke C.\n");
+        return 1;
+    }
+
+    srand((unsigned int)time(NULL));
+
+    for (int i = 0; i < length; i++) {
+        password[i] = charset[rand() % charsetSize];
+    }
+    password[length] = '\0';
+
+    // Print password
+    printf("Your glorious password: %s\n", password);
+
+    // Print random sarcastic quote
+    int idx = rand() % QUOTES;
+    printf("Sarcasm: %s\n", quotes[idx]);
+
+    free(password);
+    return 0;
+}
