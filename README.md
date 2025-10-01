@@ -1,8 +1,7 @@
 # OnlyBuilt4-Cuban-Linx...
 Don't Go Broke
-# 🎤 Tuga Trap Motivator
-
-A simple Python script that prints random motivational lines inspired by Portuguese Tuga Trap culture.
+# 🎤 Tuga Trap Motivator and stuff
+Me write some code here read study or don't do care too busy getting papers and romancing women so ya 
 
 ## Usage
 ```bash
