@@ -1,0 +1,326 @@
+# securebox — Privacy‑first file encryptor in C (ChaCha20‑Poly1305 + Argon2id)
+
+securebox is a tiny, offline command‑line tool:
+- Encrypts with ChaCha20‑Poly1305 (authenticated).
+- Derives keys via Argon2id (salted, memory‑hard).
+- Decrypts with integrity verification.
+- Secure wipe (best‑effort overwrite + sync + truncate).
+
+## Build
+- Linux (Debian/Ubuntu): `sudo apt install libsodium-dev`
+- macOS: `brew install libsodium`
+- Compile: `cc -O2 securebox.c -lsodium -o securebox`
+
+## Usage
+- Encrypt: `./securebox enc input.txt output.sec`
+- Decrypt: `./securebox dec output.sec recovered.txt`
+- Wipe:    `./securebox wipe input.txt`
+
+## Security notes
+- Authenticated encryption: tampering causes decryption to fail.
+- Argon2id KDF: resists brute‑force; still choose strong passwords.
+- Secure wipe: modern filesystems/SSDs may retain data due to wear‑leveling or journaling. Treat wipe as best‑effort. For highly sensitive data, use full‑disk encryption and secure media destruction.
+
+## Tests
+- Makefile: `make && make test`
+- Script: `./test.sh`
+
+## License
+MIT (or Apache‑2.0). See LICENSE.
+
+// securebox.c — Lightweight, idiot-proof file encryptor/decryptor with secure wipe (C + libsodium)
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <sodium.h>
+
+#define MAGIC "SBX1"
+#define SALT_LEN 16
+#define NONCE_LEN crypto_aead_chacha20poly1305_ietf_NPUBBYTES
+#define KEY_LEN crypto_aead_chacha20poly1305_ietf_KEYBYTES
+#define TAG_LEN crypto_aead_chacha20poly1305_ietf_ABYTES
+#define CHUNK 65536
+
+static void die(const char* msg) { fprintf(stderr, "Error: %s\n", msg); exit(1); }
+
+static void read_password(char* buf, size_t max) {
+    // Simple stdin read; for real TTY, use no-echo, but keep this portable/minimal
+    fprintf(stderr, "Enter password: ");
+    if (!fgets(buf, (int)max, stdin)) die("Failed to read password");
+    size_t n = strlen(buf);
+    if (n && buf[n-1] == '\n') buf[n-1] = '\0';
+    if (strlen(buf) < 4) die("Password too short (min 4 chars)");
+}
+
+static void kdf_argon2id(uint8_t key[KEY_LEN], const char* pass, const uint8_t salt[SALT_LEN]) {
+    if (crypto_pwhash(key, KEY_LEN, pass, strlen(pass), salt,
+                      crypto_pwhash_OPSLIMIT_MODERATE,
+                      crypto_pwhash_MEMLIMIT_MODERATE,
+                      crypto_pwhash_ALG_DEFAULT) != 0) {
+        die("KDF failed (out of memory or internal error)");
+    }
+}
+
+static void encrypt_file(const char* in_path, const char* out_path) {
+    FILE *fi = fopen(in_path, "rb");
+    if (!fi) die("Cannot open input file");
+    FILE *fo = fopen(out_path, "wb");
+    if (!fo) die("Cannot create output file");
+
+    uint8_t salt[SALT_LEN], nonce[NONCE_LEN], key[KEY_LEN];
+    randombytes_buf(salt, SALT_LEN);
+    randombytes_buf(nonce, NONCE_LEN);
+
+    char pass[256];
+    read_password(pass, sizeof(pass));
+    kdf_argon2id(key, pass, salt);
+    sodium_memzero(pass, sizeof(pass));
+
+    // Header: MAGIC | salt | nonce | uint64_t plaintext_size
+    if (fwrite(MAGIC, 1, 4, fo) != 4) die("Write failed");
+    if (fwrite(salt, 1, SALT_LEN, fo) != SALT_LEN) die("Write failed");
+    if (fwrite(nonce, 1, NONCE_LEN, fo) != NONCE_LEN) die("Write failed");
+
+    // Determine plaintext size
+    fseek(fi, 0, SEEK_END);
+    long sz = ftell(fi);
+    if (sz < 0) die("ftell failed");
+    fseek(fi, 0, SEEK_SET);
+    uint64_t psz = (uint64_t)sz;
+    if (fwrite(&psz, 1, sizeof(psz), fo) != sizeof(psz)) die("Write failed");
+
+    uint8_t *in = (uint8_t*)malloc(CHUNK);
+    uint8_t *out = (uint8_t*)malloc(CHUNK + TAG_LEN);
+    if (!in || !out) die("Memory alloc failed");
+
+    // Associated data = header (MAGIC+salt+nonce+size) for integrity
+    uint8_t ad[4 + SALT_LEN + NONCE_LEN + sizeof(psz)];
+    memcpy(ad, MAGIC, 4);
+    memcpy(ad+4, salt, SALT_LEN);
+    memcpy(ad+4+SALT_LEN, nonce, NONCE_LEN);
+    memcpy(ad+4+SALT_LEN+NONCE_LEN, &psz, sizeof(psz));
+
+    // Stream-like: use nonce, increment last 4 bytes as counter per chunk
+    uint8_t nonce_ctr[NONCE_LEN];
+    memcpy(nonce_ctr, nonce, NONCE_LEN);
+
+    size_t readn;
+    uint64_t counter = 0;
+    while ((readn = fread(in, 1, CHUNK, fi)) > 0) {
+        // encode counter into last 8 bytes of nonce
+        memcpy(nonce_ctr + NONCE_LEN - sizeof(counter), &counter, sizeof(counter));
+        unsigned long long outlen = 0;
+        crypto_aead_chacha20poly1305_ietf_encrypt(out, &outlen, in, readn, ad, sizeof(ad), NULL, nonce_ctr, key);
+        if (fwrite(out, 1, (size_t)outlen, fo) != outlen) die("Write failed during encryption");
+        counter++;
+    }
+    if (ferror(fi)) die("Read error");
+
+    sodium_memzero(key, KEY_LEN);
+    free(in); free(out);
+    fclose(fi); fclose(fo);
+    fprintf(stderr, "Encrypted: %s -> %s\n", in_path, out_path);
+}
+
+static void decrypt_file(const char* in_path, const char* out_path) {
+    FILE *fi = fopen(in_path, "rb");
+    if (!fi) die("Cannot open input file");
+    // Read header
+    char magic[4];
+    uint8_t salt[SALT_LEN], nonce[NONCE_LEN];
+    uint64_t psz = 0;
+
+    if (fread(magic, 1, 4, fi) != 4 || memcmp(magic, MAGIC, 4) != 0) die("Invalid file format");
+    if (fread(salt, 1, SALT_LEN, fi) != SALT_LEN) die("Read salt failed");
+    if (fread(nonce, 1, NONCE_LEN, fi) != NONCE_LEN) die("Read nonce failed");
+    if (fread(&psz, 1, sizeof(psz), fi) != sizeof(psz)) die("Read size failed");
+
+    char pass[256];
+    uint8_t key[KEY_LEN];
+    read_password(pass, sizeof(pass));
+    kdf_argon2id(key, pass, salt);
+    sodium_memzero(pass, sizeof(pass));
+
+    // Prepare AD
+    uint8_t ad[4 + SALT_LEN + NONCE_LEN + sizeof(psz)];
+    memcpy(ad, MAGIC, 4);
+    memcpy(ad+4, salt, SALT_LEN);
+    memcpy(ad+4+SALT_LEN, nonce, NONCE_LEN);
+    memcpy(ad+4+SALT_LEN+NONCE_LEN, &psz, sizeof(psz));
+
+    FILE *fo = fopen(out_path, "wb");
+    if (!fo) die("Cannot create output file");
+
+    uint8_t *in = (uint8_t*)malloc(CHUNK + TAG_LEN);
+    uint8_t *out = (uint8_t*)malloc(CHUNK);
+    if (!in || !out) die("Memory alloc failed");
+
+    uint8_t nonce_ctr[NONCE_LEN];
+    memcpy(nonce_ctr, nonce, NONCE_LEN);
+
+    uint64_t remaining = psz, counter = 0;
+    size_t readn;
+    while (remaining > 0) {
+        // ciphertext chunk size unknown; read max possible
+        readn = fread(in, 1, CHUNK + TAG_LEN, fi);
+        if (readn == 0) break;
+        memcpy(nonce_ctr + NONCE_LEN - sizeof(counter), &counter, sizeof(counter));
+        unsigned long long outlen = 0;
+        if (crypto_aead_chacha20poly1305_ietf_decrypt(out, &outlen, NULL, in, readn, ad, sizeof(ad), nonce_ctr, key) != 0) {
+            die("Decryption/authentication failed");
+        }
+        size_t towrite = (outlen > remaining) ? (size_t)remaining : (size_t)outlen;
+        if (fwrite(out, 1, towrite, fo) != towrite) die("Write failed during decryption");
+        remaining -= towrite;
+        counter++;
+    }
+    if (remaining != 0) die("Unexpected EOF or truncated file");
+
+    sodium_memzero(key, KEY_LEN);
+    free(in); free(out);
+    fclose(fi); fclose(fo);
+    fprintf(stderr, "Decrypted: %s -> %s\n", in_path, out_path);
+}
+
+static void secure_wipe(const char* path) {
+    FILE *f = fopen(path, "r+b");
+    if (!f) die("Cannot open file to wipe");
+    if (fseek(f, 0, SEEK_END) != 0) die("Seek end failed");
+    long sz = ftell(f);
+    if (sz <= 0) { fclose(f); die("File empty or size unknown"); }
+    if (fseek(f, 0, SEEK_SET) != 0) die("Seek start failed");
+
+    uint8_t *buf = (uint8_t*)malloc(CHUNK);
+    if (!buf) die("Memory alloc failed");
+    long remaining = sz;
+    while (remaining > 0) {
+        size_t n = (remaining > CHUNK) ? CHUNK : (size_t)remaining;
+        randombytes_buf(buf, n);
+        if (fwrite(buf, 1, n, f) != n) { free(buf); fclose(f); die("Overwrite failed"); }
+        remaining -= n;
+    }
+    fflush(f);
+#if defined(__unix__) || defined(__APPLE__)
+    fsync(fileno(f));
+#endif
+    free(buf);
+    fclose(f);
+    // Truncate to zero length
+#if defined(_WIN32)
+    FILE *fw = fopen(path, "wb");
+    if (fw) fclose(fw);
+#else
+    FILE *fw = fopen(path, "w");
+    if (fw) fclose(fw);
+#endif
+    fprintf(stderr, "Wiped: %s\n", path);
+}
+
+int main(int argc, char** argv) {
+    if (sodium_init() < 0) die("libsodium init failed");
+    if (argc < 2) {
+        fprintf(stderr,
+            "Usage:\n"
+            "  %s enc <in> <out>   Encrypt file\n"
+            "  %s dec <in> <out>   Decrypt file\n"
+            "  %s wipe <file>      Secure wipe file\n", argv[0], argv[0], argv[0]);
+        return 1;
+    }
+    if (!strcmp(argv[1], "enc")) {
+        if (argc != 4) die("Usage: enc <in> <out>");
+        encrypt_file(argv[2], argv[3]);
+    } else if (!strcmp(argv[1], "dec")) {
+        if (argc != 4) die("Usage: dec <in> <out>");
+        decrypt_file(argv[2], argv[3]);
+    } else if (!strcmp(argv[1], "wipe")) {
+        if (argc != 3) die("Usage: wipe <file>");
+        secure_wipe(argv[2]);
+    } else {
+        die("Unknown command");
+    }
+    return 0;
+}
+# Makefile — build, test, and clean for securebox (libsodium required)
+
+CC      := cc
+CFLAGS  := -O2 -Wall -Wextra -pedantic
+LDFLAGS := -lsodium
+SRC     := securebox.c
+BIN     := securebox
+
+.PHONY: all clean test format
+
+all: $(BIN)
+
+$(BIN): $(SRC)
+    $(CC) $(CFLAGS) $(SRC) $(LDFLAGS) -o $(BIN)
+
+clean:
+    rm -f $(BIN) testdata.txt test.enc test.out
+
+# Basic test: encrypt -> decrypt -> verify SHA256 -> wipe
+test: $(BIN)
+    @echo "Running tests..."
+    @echo "Generating sample file..."
+    @python3 - << 'PY'
+import os, hashlib, random
+data = os.urandom(1024*32) + b"SECUREBOX_TEST\n"
+with open("testdata.txt","wb") as f: f.write(data)
+print("sha256:", hashlib.sha256(data).hexdigest())
+PY
+    @echo "Encrypting..."
+    @printf "Enter password: "; echo "test123" >/dev/null
+    @echo "test123" | ./securebox enc testdata.txt test.enc
+    @echo "Decrypting..."
+    @echo "test123" | ./securebox dec test.enc test.out
+    @echo "Verifying..."
+    @python3 - << 'PY'
+import hashlib
+with open("testdata.txt","rb") as f: orig = f.read()
+with open("test.out","rb") as f: out = f.read()
+assert hashlib.sha256(orig).hexdigest()==hashlib.sha256(out).hexdigest()
+print("OK: decrypted output matches original.")
+PY
+    @echo "Wiping sample..."
+    @./securebox wipe testdata.txt
+    @if [ -s testdata.txt ]; then echo "FAIL: wipe didn't shrink file"; exit 1; else echo "OK: wiped file truncated."; fi
+    @echo "All tests passed."
+Test script (bash-only option)
+#!/usr/bin/env bash
+# test.sh — quick smoke test for securebox
+set -euo pipefail
+
+BIN=./securebox
+PW="test123"
+
+echo "Building..."
+cc -O2 securebox.c -lsodium -o $BIN
+
+echo "Creating test file..."
+python3 - << 'PY'
+import os
+with open("testdata.txt","wb") as f: f.write(os.urandom(32768)+b"SECUREBOX_TEST\n")
+PY
+
+echo "Encrypting..."
+echo "$PW" | $BIN enc testdata.txt test.enc
+
+echo "Decrypting..."
+echo "$PW" | $BIN dec test.enc test.out
+
+echo "Verifying SHA256..."
+python3 - << 'PY'
+import hashlib
+orig = open("testdata.txt","rb").read()
+out  = open("test.out","rb").read()
+assert hashlib.sha256(orig).hexdigest()==hashlib.sha256(out).hexdigest()
+print("OK: hashes match")
+PY
+
+echo "Wiping original..."
+$BIN wipe testdata.txt
+if [ -s testdata.txt ]; then echo "FAIL: wipe didn't shrink file"; exit 1; else echo "OK: wiped."; fi
+
+echo "Done."
+
