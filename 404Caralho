@@ -1,4 +1,18 @@
 /*
+# This is a Makefile.
+# Type "make" in the terminal. If you can’t do that, maybe coding isn’t for you.
+
+CC = gcc
+CFLAGS = -Wall -O2
+
+all: securebox
+
+securebox: securebox.c
+    $(CC) $(CFLAGS) -o securebox securebox.c
+
+clean:
+    rm -f securebox
+
  * securebox.c - v1.1
  *
  * A simple secure file locker with:
