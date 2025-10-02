@@ -1,0 +1,526 @@
+/*
+  BairroPump Privacy — mock surveillance capitalism, do useful privacy tasks.
+  Build: gcc -O2 -std=c99 -Wall -Wextra -o pump pump.c
+         clang -O2 -std=c99 -Wall -Wextra -o pump pump.c
+  Windows (MinGW): gcc -O2 -std=c99 -Wall -Wextra -o pump.exe pump.c
+PY?=python3
+BIN=./pump
+
+build:
+\tgcc -O2 -std=c99 -Wall -Wextra -o pump pump.c
+
+status: build
+\t$(BIN) --status
+
+scan: build
+\t$(BIN) --scan
+
+mock: build
+\t$(BIN) --mock
+
+wipe: build
+\t$(BIN) --wipe ./secrets.txt
+Taskfile.yml:
+version: '3'
+tasks:
+  build:
+    cmds:
+      - gcc -O2 -std=c99 -Wall -Wextra -o pump pump.c
+  status:
+    deps: [build]
+    cmds:
+      - ./pump --status
+  scan:
+    deps: [build]
+    cmds:
+      - ./pump --scan
+  mock:
+    deps: [build]
+    cmds:
+      - ./pump --mock
+  wipe:
+    deps: [build]
+    cmds:
+      - ./pump --wipe ./secrets.txt
+> Privacy-first, offline, cross-platform. No telemetry, no suits, no mercy. If your app needs your data to ‘work,’ it doesn’t.
+
+  Commands:
+    pump --status         : print privacy status (no telemetry, no network)
+    pump --scan           : show common environment leaks
+    pump --wipe <file>    : overwrite file securely, then delete
+    pump --mock           : print roast lines mocking surveillance capitalism
+    pump --help           : usage
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+
+#if defined(_WIN32)
+  #include <io.h>
+  #include <fcntl.h>
+  #include <windows.h>
+  #define FSYNC _commit
+  #define PATHSEP '\\'
+#else
+  #include <unistd.h>
+  #define FSYNC fsync
+  #define PATHSEP '/'
+  extern char **environ;
+#endif
+
+static const char *ROASTS[] = {
+  "Skrrt. Your data ain’t for sale today. CEOs can cry in HR.",
+  "If it’s free, you’re the product. Today, the product quit. Innit.",
+  "Bairro rules: collect discipline, not users. Ads blocked emotionally.",
+  "Telemetry disabled. Your boredom isn’t my KPI, bruv.",
+  "Surveillance capitalism? More like desperate capitalism. Go touch grass.",
+  "Opt‑out by default. That’s not a bug; that’s culture.",
+  "If the app’s ‘improving with data,’ tell it to improve without you.",
+  "Cookies accepted? Only the edible kind. Caralho.",
+  "No dashboards, no tracking, just results. Wagwan, privacy.",
+  "Your attention is currency. We refuse the exchange."
+};
+static const size_t ROASTS_N = sizeof(ROASTS)/sizeof(ROASTS[0]);
+
+static void usage(void) {
+  printf("BairroPump Privacy (C, offline)\n");
+  printf("Usage:\n");
+  printf("  pump --status\n");
+  printf("  pump --scan\n");
+  printf("  pump --wipe <file>\n");
+  printf("  pump --mock\n");
+  printf("  pump --help\n");
+}
+
+static void status(void) {
+  printf("[STATUS]\n");
+  printf("- No telemetry, analytics, or network calls.\n");
+  printf("- Offline-only. If a module tries net, it will be refused.\n");
+  printf("- Single binary, cross-platform, potato-ready.\n");
+}
+
+#if defined(_WIN32)
+static void scan_env(void) {
+  // Windows: use GetEnvironmentVariable on a shortlist
+  const char *keys[] = {"USERNAME","USERPROFILE","APPDATA","LOCALAPPDATA","TEMP","PATH","COMPUTERNAME"};
+  printf("[SCAN] Environment leaks (Windows):\n");
+  for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); i++) {
+    char buf[4096]; DWORD n = GetEnvironmentVariableA(keys[i], buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+      printf("- %s = %s\n", keys[i], buf);
+    } else {
+      printf("- %s = (unset)\n", keys[i]);
+    }
+  }
+}
+#else
+static void scan_env(void) {
+  const char *keys[] = {"USER","USERNAME","HOME","SHELL","PATH","LOGNAME","HOSTNAME","PWD","LANG","XDG_DATA_HOME"};
+  printf("[SCAN] Environment leaks (POSIX):\n");
+  for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); i++) {
+    const char *v = getenv(keys[i]);
+    printf("- %s = %s\n", keys[i], v ? v : "(unset)");
+  }
+}
+#endif
+
+static int wipe_file(const char *path, int passes) {
+  FILE *f = fopen(path, "rb+");
+  if (!f) {
+    fprintf(stderr, "[WIPE] Cannot open '%s': %s\n", path, strerror(errno));
+    return -1;
+  }
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fprintf(stderr, "[WIPE] Seek end failed: %s\n", strerror(errno));
+    fclose(f);
+    return -1;
+  }
+  long sz = ftell(f);
+  if (sz < 0) {
+    fprintf(stderr, "[WIPE] Size unknown: %s\n", strerror(errno));
+    fclose(f);
+    return -1;
+  }
+  if (sz == 0) {
+    printf("[WIPE] File is empty, deleting.\n");
+    fclose(f);
+    remove(path);
+    return 0;
+  }
+  srand((unsigned)time(NULL));
+  unsigned char *buf = (unsigned char*)malloc(64 * 1024);
+  if (!buf) {
+    fprintf(stderr, "[WIPE] Memory alloc failed.\n");
+    fclose(f);
+    return -1;
+  }
+  for (int p = 1; p <= passes; p++) {
+    if (fseek(f, 0, SEEK_SET) != 0) { fprintf(stderr, "[WIPE] Seek start failed.\n"); free(buf); fclose(f); return -1; }
+    long remaining = sz;
+    printf("[WIPE] Pass %d/%d over %ld bytes...\n", p, passes, sz);
+    while (remaining > 0) {
+      size_t chunk = (remaining > (long)(64*1024)) ? (64*1024) : (size_t)remaining;
+      for (size_t i = 0; i < chunk; i++) buf[i] = (unsigned char)(rand() & 0xFF);
+      if (fwrite(buf, 1, chunk, f) != chunk) { fprintf(stderr, "[WIPE] Write failed.\n"); free(buf); fclose(f); return -1; }
+      remaining -= (long)chunk;
+    }
+    fflush(f);
+#if defined(_WIN32)
+    FSYNC(_fileno(f));
+#else
+    FSYNC(fileno(f));
+#endif
+  }
+  free(buf);
+  fclose(f);
+  if (remove(path) != 0) {
+    fprintf(stderr, "[WIPE] Delete failed: %s\n", strerror(errno));
+    return -1;
+  }
+  printf("[WIPE] Done. File securely overwritten and deleted.\n");
+  return 0;
+}
+
+static void mock(void) {
+  printf("[MOCK] Surveillance capitalism, roasted:\n");
+  for (size_t i = 0; i < ROASTS_N; i++) {
+    printf("  - %s\n", ROASTS[i]);
+  }
+  printf("\nTip: If an app demands your data ‘to improve experience,’ it’s improving its margins, not your life.\n");
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) { usage(); return 0; }
+  if (strcmp(argv[1],"--help")==0) { usage(); return 0; }
+  if (strcmp(argv[1],"--status")==0) { status(); return 0; }
+  if (strcmp(argv[1],"--scan")==0) { scan_env(); return 0; }
+  if (strcmp(argv[1],"--mock")==0) { mock(); return 0; }
+  if (strcmp(argv[1],"--wipe")==0) {
+    if (argc < 3) { fprintf(stderr, "Provide a file path: pump --wipe <file>\n"); return 1; }
+    const char *path = argv[2];
+    // Default passes = 3 (idiot-proof, good-enough for HDD; SSD behavior varies)
+    return wipe_file(path, 3) == 0 ? 0 : 1;
+/*
+  BairroPump Privacy — TUI + Multilingual Roast (single file)
+  Build:
+    gcc -O2 -std=c99 -Wall -Wextra -o pump pump.c        (Linux/macOS)
+    clang -O2 -std=c99 -Wall -Wextra -o pump pump.c       (macOS)
+    gcc -O2 -std=c99 -Wall -Wextra -o pump.exe pump.c     (Windows MinGW)
+
+  Run:
+    ./pump            (Linux/macOS)
+    pump.exe          (Windows)
+
+  Notes:
+    - Offline-only. No telemetry, no analytics, no network.
+    - Secure wipe overwrites then deletes. SSDs use wear-leveling; also use full-disk encryption for best results.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+
+#if defined(_WIN32)
+  #include <windows.h>
+  #include <io.h>
+  #define FSYNC _commit
+#else
+  #include <unistd.h>
+  #define FSYNC fsync
+  extern char **environ;
+#endif
+
+/* ----------------------- UI helpers ----------------------- */
+
+static void clear_screen(void) {
+#if defined(_WIN32)
+  system("cls");
+#else
+  system("clear");
+#endif
+}
+
+static void pause_enter(void) {
+  printf("\nPress ENTER to continue...");
+  fflush(stdout);
+  int c;
+  while ((c = getchar()) != '\n' && c != EOF) {}
+}
+
+/* ----------------------- Language handling ----------------------- */
+
+typedef enum {
+  LANG_EN = 0,
+  LANG_PT,
+  LANG_DE,
+  LANG_FR,
+  LANG_TL,
+  LANG_AR,
+  LANG_COUNT
+} Lang;
+
+static const char *LANG_NAMES[LANG_COUNT] = {
+  "English", "Português (PT-PT)", "Deutsch", "Français", "Tagalog", "العربية"
+};
+
+static Lang choose_language(void) {
+  int choice = 0;
+  while (1) {
+    clear_screen();
+    printf("Choose language for ROASTS:\n");
+    for (int i = 0; i < LANG_COUNT; i++) {
+      printf("  %d) %s\n", i + 1, LANG_NAMES[i]);
+    }
+    printf("\nSelect [1-%d] (default 1): ", LANG_COUNT);
+    char buf[16]; if (!fgets(buf, sizeof(buf), stdin)) return LANG_EN;
+    if (buf[0] == '\n' || buf[0] == '\0') return LANG_EN;
+    choice = atoi(buf);
+    if (choice >= 1 && choice <= LANG_COUNT) return (Lang)(choice - 1);
+    printf("Invalid choice. ");
+    pause_enter();
+  }
+}
+
+/* ----------------------- Roast lines ----------------------- */
+
+static const char *ROASTS_EN[] = {
+  "Skrrt. Your data ain’t for sale today. CEOs can cry elsewhere.",
+  "If it’s free, you’re the product. Today, the product quit. Innit.",
+  "Collect discipline, not users. Ads blocked emotionally.",
+  "Telemetry disabled. Your boredom isn’t my KPI, bruv.",
+  "Surveillance capitalism? Desperate capitalism. Touch grass.",
+  "Opt-out by default. That’s not a bug; that’s culture.",
+  "If the app ‘improves with data,’ tell it to improve without you.",
+  "Cookies accepted? Only the edible kind.",
+  "No dashboards, no tracking—just results.",
+  "Your attention is currency. We refuse the exchange."
+};
+static const char *ROASTS_PT[] = {
+  "Skrrt. Hoje os teus dados não estão à venda. Problema deles.",
+  "Se é grátis, tu és o produto. Hoje o produto demitiu-se.",
+  "Coleciona disciplina, não utilizadores. Anúncios bloqueados emocionalmente.",
+  "Sem telemetria. O teu tédio não é KPI.",
+  "Capitalismo de vigilância? Mais parece desespero. Vai apanhar ar.",
+  "Opt-out por defeito. Não é bug; é cultura.",
+  "Se a app ‘melhora com dados’, que melhore sem ti.",
+  "Cookies aceites? Só as de chocolate.",
+  "Sem dashboards, sem tracking—só resultados.",
+  "A tua atenção é moeda. Recusamos a troca."
+};
+static const char *ROASTS_DE[] = {
+  "Skrrt. Deine Daten sind heute unverkäuflich. Heul woanders.",
+  "Wenn’s gratis ist, bist du das Produkt. Heute kündigt das Produkt.",
+  "Sammle Disziplin, nicht Nutzer. Ads, aber emotional blockiert.",
+  "Keine Telemetrie. Dein Langeweile-Level ist kein KPI.",
+  "Überwachungs-Kapitalismus? Eher Verzweiflung. Geh raus.",
+  "Opt-out standard. Kein Bug; Kultur.",
+  "Wenn die App ‘mit Daten besser wird’, soll sie ohne dich besser werden.",
+  "Cookies akzeptiert? Nur die essbaren.",
+  "Keine Dashboards, kein Tracking—nur Ergebnisse.",
+  "Deine Aufmerksamkeit ist Währung. Tausch abgelehnt."
+};
+static const char *ROASTS_FR[] = {
+  "Skrrt. Tes données ne sont pas à vendre aujourd’hui.",
+  "Si c’est gratuit, tu es le produit. Aujourd’hui, le produit démissionne.",
+  "Collectionne la discipline, pas les utilisateurs.",
+  "Pas de télémétrie. Ton ennui n’est pas un KPI.",
+  "Capitalisme de surveillance ? Plutôt du désespoir. Va prendre l’air.",
+  "Opt-out par défaut. Pas un bug ; une culture.",
+  "Si l’app ‘s’améliore avec les données’, qu’elle s’améliore sans toi.",
+  "Cookies acceptés ? Uniquement ceux qu’on mange.",
+  "Pas de dashboards, pas de tracking—juste des résultats.",
+  "Ton attention est une monnaie. Échange refusé."
+};
+static const char *ROASTS_TL[] = {
+  "Skrrt. Di binebenta data mo ngayon. Umiiyak sila, bahala sila.",
+  "Kung libre, ikaw ang produkto. Ngayon, nag-resign ang produkto.",
+  "Ipon ng disiplina, hindi users. Ads blocked emotionally.",
+  "Walang telemetry. Hindi KPI ang inip mo.",
+  "Surveillance capitalism? Desperado lang ‘yan. Labas ka muna.",
+  "Opt-out by default. Hindi bug; kultura.",
+  "Kung ‘gumaganda’ ang app sa data, pagandahin niya nang wala ka.",
+  "Cookies accepted? Yung edible lang.",
+  "Walang dashboard, walang tracking—resulta lang.",
+  "Pera ang atensyon mo. Ayaw namin i-trade."
+};
+static const char *ROASTS_AR[] = {
+  "سكرت. بياناتك مش للبيع اليوم.",
+  "إذا مجاني فأنت المنتج. اليوم المنتج استقال.",
+  "اجمع الانضباط، مش المستخدمين.",
+  "لا تتبّع. مللك مش KPI.",
+  "رأسمالية المراقبة؟ يأس لا أكثر. اطلع تنفّس.",
+  "الخروج الافتراضي. هذا ثقافة، مش خطأ.",
+  "إذا التطبيق يتحسّن بالبيانات، خلّيه يتحسّن بدونك.",
+  "كوكيز مقبولة؟ بس اللي بتتاكل.",
+  "لا لوحات، لا تتبّع—بس نتائج.",
+  "انتباهك عملة. الصفقة مرفوضة."
+};
+
+static void print_roasts(Lang lang) {
+  const char **list = ROASTS_EN; size_t n = sizeof(ROASTS_EN)/sizeof(ROASTS_EN[0]);
+  switch (lang) {
+    case LANG_PT: list = ROASTS_PT; n = sizeof(ROASTS_PT)/sizeof(ROASTS_PT[0]); break;
+    case LANG_DE: list = ROASTS_DE; n = sizeof(ROASTS_DE)/sizeof(ROASTS_DE[0]); break;
+    case LANG_FR: list = ROASTS_FR; n = sizeof(ROASTS_FR)/sizeof(ROASTS_FR[0]); break;
+    case LANG_TL: list = ROASTS_TL; n = sizeof(ROASTS_TL)/sizeof(ROASTS_TL[0]); break;
+    case LANG_AR: list = ROASTS_AR; n = sizeof(ROASTS_AR)/sizeof(ROASTS_AR[0]); break;
+    default: break;
+  }
+  printf("\n[ROAST] Surveillance capitalism, roasted in %s:\n", LANG_NAMES[lang]);
+  for (size_t i = 0; i < n; i++) {
+    printf("  - %s\n", list[i]);
+  }
+}
+
+/* ----------------------- Privacy tools ----------------------- */
+
+static void status(void) {
+  printf("\n[STATUS]\n");
+  printf("- Offline-only. No telemetry, analytics, or network calls.\n");
+  printf("- Single binary, cross-platform, potato-ready.\n");
+  printf("- Tools: Env scan, secure wipe, multilingual roasts.\n");
+}
+
+#if defined(_WIN32)
+static void scan_env(void) {
+  const char *keys[] = {"USERNAME","USERPROFILE","APPDATA","LOCALAPPDATA","TEMP","PATH","COMPUTERNAME"};
+  printf("\n[SCAN] Environment (Windows):\n");
+  for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); i++) {
+    char buf[4096]; DWORD n = GetEnvironmentVariableA(keys[i], buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) printf("- %s = %s\n", keys[i], buf);
+    else printf("- %s = (unset)\n", keys[i]);
+  }
+}
+#else
+static void scan_env(void) {
+  const char *keys[] = {"USER","USERNAME","HOME","SHELL","PATH","LOGNAME","HOSTNAME","PWD","LANG","XDG_DATA_HOME"};
+  printf("\n[SCAN] Environment (POSIX):\n");
+  for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); i++) {
+    const char *v = getenv(keys[i]);
+    printf("- %s = %s\n", keys[i], v ? v : "(unset)");
+  }
+}
+#endif
+
+static int wipe_file(const char *path, int passes) {
+  FILE *f = fopen(path, "rb+");
+  if (!f) { fprintf(stderr, "[WIPE] Cannot open '%s': %s\n", path, strerror(errno)); return -1; }
+  if (fseek(f, 0, SEEK_END) != 0) { fprintf(stderr, "[WIPE] Seek end failed: %s\n", strerror(errno)); fclose(f); return -1; }
+  long sz = ftell(f);
+  if (sz <= 0) { fclose(f); if (sz == 0) { printf("[WIPE] Empty file, deleting.\n"); remove(path); return 0; } fprintf(stderr, "[WIPE] Bad size.\n"); return -1; }
+  srand((unsigned)time(NULL));
+  unsigned char *buf = (unsigned char*)malloc(64 * 1024);
+  if (!buf) { fprintf(stderr, "[WIPE] Memory alloc failed.\n"); fclose(f); return -1; }
+
+  for (int p = 1; p <= passes; p++) {
+    if (fseek(f, 0, SEEK_SET) != 0) { fprintf(stderr, "[WIPE] Seek start failed.\n"); free(buf); fclose(f); return -1; }
+    long remaining = sz;
+    printf("[WIPE] Pass %d/%d over %ld bytes...\n", p, passes, sz);
+    while (remaining > 0) {
+      size_t chunk = (remaining > (long)(64*1024)) ? (64*1024) : (size_t)remaining;
+      for (size_t i = 0; i < chunk; i++) buf[i] = (unsigned char)(rand() & 0xFF);
+      if (fwrite(buf, 1, chunk, f) != chunk) { fprintf(stderr, "[WIPE] Write failed.\n"); free(buf); fclose(f); return -1; }
+      remaining -= (long)chunk;
+    }
+    fflush(f);
+#if defined(_WIN32)
+    FSYNC(_fileno(f));
+#else
+    FSYNC(fileno(f));
+#endif
+  }
+  free(buf);
+  fclose(f);
+  if (remove(path) != 0) { fprintf(stderr, "[WIPE] Delete failed: %s\n", strerror(errno)); return -1; }
+  printf("[WIPE] Done. File overwritten and deleted.\n");
+  return 0;
+}
+
+/* ----------------------- TUI actions ----------------------- */
+
+static void do_status(void) { status(); pause_enter(); }
+
+static void do_scan(void) { scan_env(); pause_enter(); }
+
+static void do_mock(Lang *current_lang) {
+  printf("\nUse current language (%s)? [y/N]: ", LANG_NAMES[*current_lang]);
+  char buf[8]; if (!fgets(buf, sizeof(buf), stdin)) return;
+  if (buf[0] == 'y' || buf[0] == 'Y') {
+    print_roasts(*current_lang);
+  } else {
+    *current_lang = choose_language();
+    print_roasts(*current_lang);
+  }
+  pause_enter();
+}
+
+static void do_wipe(void) {
+  char path[1024];
+  printf("\nEnter file path to WIPE (example: secrets.txt): ");
+  if (!fgets(path, sizeof(path), stdin)) return;
+  size_t len = strlen(path);
+  if (len > 0 && path[len - 1] == '\n') path[len - 1] = '\0';
+  if (path[0] == '\0') { printf("No path given.\n"); pause_enter(); return; }
+
+  printf("Passes [default 3]: ");
+  char buf[16]; if (!fgets(buf, sizeof(buf), stdin)) return;
+  int passes = atoi(buf);
+  if (passes <= 0) passes = 3;
+
+  printf("\nConfirm WIPE of '%s' with %d passes? Type YES: ", path, passes);
+  char ok[16]; if (!fgets(ok, sizeof(ok), stdin)) return;
+  if (strncmp(ok, "YES", 3) != 0) { printf("Cancelled.\n"); pause_enter(); return; }
+
+  int rc = wipe_file(path, passes);
+  if (rc == 0) printf("Success.\n"); else printf("Failed.\n");
+  pause_enter();
+}
+
+/* ----------------------- Main menu ----------------------- */
+
+static void banner(void) {
+  printf("=============================================\n");
+  printf(" BairroPump Privacy — Offline, Multilingual \n");
+  printf(" Idiot-proof TUI. No suits. No telemetry.   \n");
+  printf("=============================================\n");
+}
+
+static void menu(void) {
+  printf("\n[MENU]\n");
+  printf("  1) Status\n");
+  printf("  2) Scan environment\n");
+  printf("  3) Roast surveillance capitalism\n");
+  printf("  4) Secure wipe a file\n");
+  printf("  q) Quit\n");
+  printf("\nChoose: ");
+}
+
+int main(void) {
+  Lang current_lang = LANG_EN;
+  for (;;) {
+    clear_screen();
+    banner();
+    menu();
+    char choice[8];
+    if (!fgets(choice, sizeof(choice), stdin)) break;
+    if (choice[0] == '1') { do_status(); }
+    else if (choice[0] == '2') { do_scan(); }
+    else if (choice[0] == '3') { do_mock(&current_lang); }
+    else if (choice[0] == '4') { do_wipe(); }
+    else if (choice[0] == 'q' || choice[0] == 'Q') { break; }
+    else { printf("Invalid choice.\n"); pause_enter(); }
+  }
+  printf("\nBye.\n");
+  return 0;
+}
+
+  }
+  fprintf(stderr, "Unknown command: %s\n", argv[1]);
+  usage();
+  return 1;
+}
